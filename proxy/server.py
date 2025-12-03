@@ -7,7 +7,7 @@ from typing import Dict, Set, Optional
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from config.settings import PROXY_HOST, BOT_TOKEN
+from config.settings import PROXY_HOST, BOT_TOKEN, PROXY_START_DELAY
 from db.models import init_db, get_session, User, Mode, Device
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ class StratumProxyServer:
         self._lock = asyncio.Lock()
         self._watch_task: Optional[asyncio.Task] = None
         self._running: bool = False
+        self._start_delay: int = int(PROXY_START_DELAY or 0)
 
     async def start(self):
         """Запускает серверы для всех пользователей из БД."""
@@ -43,12 +44,18 @@ class StratumProxyServer:
         self._running = True
         session = get_session(self._engine)
         try:
-            users = session.query(User).all()
+            users = session.query(User).order_by(User.id.asc()).all()
             if not users:
                 logger.warning("В БД нет пользователей. Прокси серверы не запущены.")
                 return
-            for user in users:
+            total = len(users)
+            for idx, user in enumerate(users, start=1):
                 await self._start_port(user.port)
+                # Поочередный запуск портов с задержкой, чтобы избежать одновременных подключений
+                # Задержка управляется настройкой PROXY_START_DELAY
+                if self._start_delay > 0 and idx < total:
+                    logger.info(f"Задержка {self._start_delay}с перед запуском следующего порта (user_id={user.id})")
+                    await asyncio.sleep(self._start_delay)
             logger.info(f"Запущено портов: {len(self._servers)}")
         finally:
             session.close()

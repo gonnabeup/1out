@@ -17,6 +17,7 @@ TELEGRAM_TOKEN = BOT_TOKEN  # сохранение совместимости с
 DEFAULT_PORT_RANGE = (4000, 4200)  # Диапазон портов для пользователей
 PROXY_HOST = '0.0.0.0'  # Хост для прослушивания
 SCHEDULER_CHECK_INTERVAL = 60  # Интервал проверки расписаний в секундах
+PROXY_START_DELAY = int(os.getenv('PROXY_START_DELAY', '30'))  # Задержка между запуском портов (сек)
 
 # Настройки логирования
 LOG_DIR = BASE_DIR / 'logs'
