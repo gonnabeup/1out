@@ -124,6 +124,11 @@ class StratumProxyServer:
             logger.info(f"Порт {port} уже запущен. Пропускаю старт.")
             return
 
+        # Если режим sleep, не запускаем сервер (порт будет закрыт)
+        if self._port_mode.get(port, {}).get("mode_name") == "sleep":
+            logger.info(f"Порт {port} имеет режим 'sleep'. Сервер не запускаем (порт закрыт).")
+            return
+
         server = await asyncio.start_server(lambda r, w: self._handle_client(r, w, port), self.host, port)
         self._servers[port] = server
         self._clients.setdefault(port, set())
@@ -208,6 +213,11 @@ class StratumProxyServer:
                 # Если появился новый пользователь (новый порт), запускаем его
                 for port in now_map.keys():
                     if port not in self._servers:
+                        # Если порт в режиме sleep и мы уже знаем об этом, не пытаемся запускать снова
+                        cached = self._port_mode.get(port)
+                        if cached and cached.get("mode_name") == "sleep" and now_map[port].get("mode_name") == "sleep":
+                            continue
+
                         try:
                             await self._start_port(port)
                         except Exception as e:
