@@ -222,6 +222,16 @@ class StratumProxyServer:
                             await self._start_port(port)
                         except Exception as e:
                             logger.warning(f"Не удалось запустить новый порт {port}: {e}")
+                    
+                    # Если порт запущен, но режим сменился на sleep, принудительно останавливаем
+                    elif port in self._servers and now_map[port].get("mode_name") == "sleep":
+                         logger.info(f"Обнаружен активный порт {port} в режиме 'sleep'. Останавливаю сервер.")
+                         try:
+                             await self._stop_port(port)
+                             # Обновляем кэш, чтобы знать, что порт теперь в sleep
+                             self._port_mode[port] = now_map[port]
+                         except Exception as e:
+                             logger.warning(f"Ошибка остановки порта {port}: {e}")
 
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
@@ -459,7 +469,13 @@ class StratumProxyServer:
                                 
                                 method_info = f" (method={req_method})" if req_method else ""
                                 
-                                if m in ("stale-work", "unknown-work"):
+                                # Список ошибок, которые логируем как INFO (не критичные)
+                                is_soft_error = (
+                                    m in ("stale-work", "unknown-work", "unfit, ignore", "high-hash") or
+                                    req_method == "mining.suggest_difficulty"
+                                )
+
+                                if is_soft_error:
                                     logger.info(f"Ответ пула: {m} для {addr} на порту {port} (code={code}){method_info}")
                                 else:
                                     logger.warning(f"Ответ пула с ошибкой для {addr} на порту {port}{method_info}: {err}")
