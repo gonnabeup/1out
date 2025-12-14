@@ -301,6 +301,8 @@ class StratumProxyServer:
 
         # Счётчики ошибок пула на время данного соединения
         error_counts = {}
+        # Отслеживание методов запросов по ID
+        request_methods = {}
 
         async def forward_to_pool():
             try:
@@ -319,7 +321,12 @@ class StratumProxyServer:
                         await pool_writer.drain()
                         continue
 
+                    # Сохраняем метод запроса для диагностики ошибок
+                    req_id = msg.get("id")
                     method = msg.get("method")
+                    if req_id is not None and method:
+                        request_methods[req_id] = method
+
                     if method == "mining.authorize":
                         params = msg.get("params", [])
                         # Используем alias_login из активного режима, полученного при подключении
@@ -433,6 +440,11 @@ class StratumProxyServer:
                         resp_text = data.decode(errors='ignore').strip()
                         if resp_text:
                             resp = json.loads(resp_text)
+                            resp_id = resp.get("id")
+                            
+                            # Получаем метод, вызвавший ответ, и очищаем его из памяти
+                            req_method = request_methods.pop(resp_id, None) if resp_id is not None else None
+
                             err = resp.get("error")
                             if err is not None:
                                 # Stratum обычно возвращает [code, message, data]
@@ -444,10 +456,13 @@ class StratumProxyServer:
                                     code = err.get("code")
                                     message = err.get("message")
                                 m = str(message) if message is not None else str(err)
+                                
+                                method_info = f" (method={req_method})" if req_method else ""
+                                
                                 if m in ("stale-work", "unknown-work"):
-                                    logger.info(f"Ответ пула: {m} для {addr} на порту {port} (code={code})")
+                                    logger.info(f"Ответ пула: {m} для {addr} на порту {port} (code={code}){method_info}")
                                 else:
-                                    logger.warning(f"Ответ пула с ошибкой для {addr} на порту {port}: {err}")
+                                    logger.warning(f"Ответ пула с ошибкой для {addr} на порту {port}{method_info}: {err}")
                                 # Счётчики на соединение
                                 key = m or "error"
                                 error_counts[key] = error_counts.get(key, 0) + 1
