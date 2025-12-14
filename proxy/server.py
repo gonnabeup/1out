@@ -203,6 +203,17 @@ class StratumProxyServer:
                 # Сравниваем и перезагружаем только изменившиеся порты
                 for port, new_conf in now_map.items():
                     old_conf = self._port_mode.get(port)
+                    # Если режим сменился на sleep, нам нужно не перезагружать порт, а остановить его
+                    if new_conf.get("mode_name") == "sleep":
+                        if port in self._servers:
+                             logger.info(f"Обнаружен переход порта {port} в режим 'sleep'. Останавливаю сервер.")
+                             try:
+                                 await self._stop_port(port)
+                                 self._port_mode[port] = new_conf
+                             except Exception as e:
+                                 logger.warning(f"Ошибка остановки порта {port}: {e}")
+                        continue
+                        
                     if old_conf != new_conf:
                         logger.info(f"Обнаружено изменение режима на порту {port}: {old_conf} -> {new_conf}. Перезагружаю порт.")
                         try:
