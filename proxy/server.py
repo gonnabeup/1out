@@ -251,6 +251,19 @@ class StratumProxyServer:
                 logger.warning(f"Ошибка в мониторинге активных режимов: {e}")
                 await asyncio.sleep(5)
 
+    async def _send_offline_notification(self, tg_id: int, device_name: str, worker_info: str):
+        """Отправка уведомления об отключении устройства в фоне."""
+        try:
+            # Используем отдельный сеанс бота
+            bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+            text = f"❗️ {device_name}{worker_info} стал оффлайн."
+            try:
+                await bot.send_message(chat_id=tg_id, text=text)
+            finally:
+                await bot.session.close()
+        except Exception as e:
+            logger.warning(f"Ошибка отправки уведомления об оффлайне (bg): {e}")
+
     async def _handle_client(self, miner_reader: asyncio.StreamReader, miner_writer: asyncio.StreamWriter, port: int):
         addr = miner_writer.get_extra_info('peername')
         client_task = asyncio.current_task()
@@ -537,17 +550,15 @@ class StratumProxyServer:
                                     dev.is_online = 0
                                     dev.last_seen_at = datetime.datetime.utcnow()
                                     session.commit()
-                                    # Попробуем отправить уведомление пользователю о отключении устройства
+                                    # Попробуем отправить уведомление пользователю о отключении устройства в фоне
                                     try:
                                         if BOT_TOKEN and getattr(u, "tg_id", None):
-                                            bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-                                            name = dev.name or dev.worker or "Аппарат"
-                                            worker_info = f" ({dev.worker})" if dev.worker else ""
-                                            text = f"❗️ {name}{worker_info} стал оффлайн."
-                                            await bot.send_message(chat_id=u.tg_id, text=text)
-                                            await bot.session.close()
+                                            tg_id = u.tg_id
+                                            d_name = dev.name or dev.worker or "Аппарат"
+                                            w_info = f" ({dev.worker})" if dev.worker else ""
+                                            asyncio.create_task(self._send_offline_notification(tg_id, d_name, w_info))
                                     except Exception as e:
-                                        logger.warning(f"Ошибка отправки уведомления об оффлайне: {e}")
+                                        logger.warning(f"Ошибка запуска уведомления об оффлайне: {e}")
                             session.close()
                         except Exception as e:
                             logger.warning(f"Не удалось отметить оффлайн Device для порта {port}: {e}")
