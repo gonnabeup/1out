@@ -29,6 +29,8 @@ class StratumProxyServer:
         self._engine = init_db()
         self._servers: Dict[int, asyncio.AbstractServer] = {}
         self._clients: Dict[int, Set[asyncio.Task]] = {}
+        # Реестр активных сокетов для принудительного закрытия
+        self._client_sockets: Dict[int, Set[asyncio.StreamWriter]] = {}
         # Учёт занятых воркеров по порту: базовая строка alias[.worker] -> счётчик
         self._active_workers: Dict[int, Dict[asyncio.Task, str]] = {}
         self._worker_counts: Dict[int, Dict[str, int]] = {}
@@ -146,6 +148,14 @@ class StratumProxyServer:
             except Exception as e:
                 logger.warning(f"Ошибка при закрытии сервера порта {port}: {e}")
         
+        # Принудительно закрываем все активные сокеты майнеров
+        sockets = self._client_sockets.pop(port, set())
+        for sock in list(sockets):
+            try:
+                sock.close()
+            except Exception:
+                pass
+        
         # Отменить активные клиентские задачи
         tasks = self._clients.pop(port, set())
         for t in list(tasks):
@@ -155,9 +165,12 @@ class StratumProxyServer:
                 pass
         if tasks:
             try:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            except Exception:
-                pass
+                # Ждем завершения задач с таймаутом, чтобы не зависнуть навсегда
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"Таймаут ожидания завершения клиентов на порту {port}")
+            except Exception as e:
+                logger.warning(f"Ошибка ожидания завершения клиентов на порту {port}: {e}")
         # Очистить учёт воркеров
         self._active_workers.pop(port, None)
         self._worker_counts.pop(port, None)
@@ -268,6 +281,8 @@ class StratumProxyServer:
         addr = miner_writer.get_extra_info('peername')
         client_task = asyncio.current_task()
         self._clients.setdefault(port, set()).add(client_task)
+        # Регистрируем сокет для возможности принудительного закрытия
+        self._client_sockets.setdefault(port, set()).add(miner_writer)
         logger.info(f"Подключен майнер {addr} -> порт {port}")
 
         # Актуализируем активный режим из БД, чтобы не требовалась перезагрузка
@@ -311,7 +326,10 @@ class StratumProxyServer:
             except Exception:
                 pass
             miner_writer.close()
-            await miner_writer.wait_closed()
+            try:
+                await asyncio.wait_for(miner_writer.wait_closed(), timeout=2.0)
+            except Exception:
+                pass
             self._clients.get(port, set()).discard(client_task)
             return
 
@@ -327,7 +345,7 @@ class StratumProxyServer:
             logger.error(f"Майнер {addr}: не удалось подключиться к пулу {host}:{upstream_port}: {e}")
             miner_writer.close()
             try:
-                await miner_writer.wait_closed()
+                await asyncio.wait_for(miner_writer.wait_closed(), timeout=2.0)
             except Exception:
                 pass
             self._clients.get(port, set()).discard(client_task)
@@ -459,7 +477,11 @@ class StratumProxyServer:
             finally:
                 try:
                     pool_writer.close()
-                    await pool_writer.wait_closed()
+                    # Добавляем таймаут на ожидание закрытия
+                    try:
+                        await asyncio.wait_for(pool_writer.wait_closed(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pass
                 except Exception:
                     pass
 
@@ -518,14 +540,19 @@ class StratumProxyServer:
             finally:
                 try:
                     miner_writer.close()
-                    await miner_writer.wait_closed()
+                    # Добавляем таймаут на ожидание закрытия
+                    try:
+                        await asyncio.wait_for(miner_writer.wait_closed(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pass
                 except Exception:
                     pass
 
         try:
-            await asyncio.gather(forward_to_pool(), forward_to_miner())
+                await asyncio.gather(forward_to_pool(), forward_to_miner())
         finally:
             self._clients.get(port, set()).discard(client_task)
+            self._client_sockets.get(port, set()).discard(miner_writer)
             # Корректировка счётчиков воркеров на порту
             active_map = self._active_workers.get(port)
             counts = self._worker_counts.get(port)
