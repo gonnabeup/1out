@@ -35,7 +35,11 @@ class StratumProxyServer:
         self._active_workers: Dict[int, Dict[asyncio.Task, str]] = {}
         self._worker_counts: Dict[int, Dict[str, int]] = {}
         self._port_mode: Dict[int, dict] = {}
-        self._lock = asyncio.Lock()
+        # Локи для каждого порта отдельно, чтобы перезагрузка одного не блокировала других
+        self._port_locks: Dict[int, asyncio.Lock] = {}
+        # Множество портов, которые сейчас перезагружаются
+        self._reloading_ports: Set[int] = set()
+        
         self._watch_task: Optional[asyncio.Task] = None
         self._running: bool = False
         self._start_delay: int = int(PROXY_START_DELAY or 0)
@@ -87,11 +91,26 @@ class StratumProxyServer:
 
     async def reload_port(self, port: int):
         """Точечная перезагрузка сервера на указанном порту."""
-        async with self._lock:
-            logger.info(f"Перезагрузка порта {port}...")
-            await self._stop_port(port)
-            await self._start_port(port)
-            logger.info(f"Порт {port} перезагружен")
+        # Получаем или создаем лок для порта
+        if port not in self._port_locks:
+            self._port_locks[port] = asyncio.Lock()
+        
+        lock = self._port_locks[port]
+        
+        # Если лок занят, значит порт уже перезагружается кем-то другим
+        if lock.locked():
+             logger.info(f"Порт {port} уже перезагружается, пропускаю повторный запрос.")
+             return
+
+        async with lock:
+            try:
+                self._reloading_ports.add(port)
+                logger.info(f"Перезагрузка порта {port}...")
+                await self._stop_port(port)
+                await self._start_port(port)
+                logger.info(f"Порт {port} перезагружен")
+            finally:
+                self._reloading_ports.discard(port)
 
     async def _start_port(self, port: int):
         """Запуск прослушивания указанного порта, если для него существует пользователь."""
@@ -139,22 +158,30 @@ class StratumProxyServer:
 
     async def _stop_port(self, port: int):
         """Остановка прослушивания порта и завершение клиентских соединений."""
+        logger.debug(f"[_stop_port:{port}] Начало остановки...")
+        
         # Закрыть сервер
         server = self._servers.pop(port, None)
         if server:
             try:
+                logger.debug(f"[_stop_port:{port}] Закрытие сервера...")
                 server.close()
-                await server.wait_closed()
+                await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+                logger.debug(f"[_stop_port:{port}] Сервер закрыт.")
+            except asyncio.TimeoutError:
+                logger.warning(f"[_stop_port:{port}] Таймаут закрытия сервера (wait_closed)")
             except Exception as e:
                 logger.warning(f"Ошибка при закрытии сервера порта {port}: {e}")
         
         # Принудительно закрываем все активные сокеты майнеров
         sockets = self._client_sockets.pop(port, set())
-        for sock in list(sockets):
-            try:
-                sock.close()
-            except Exception:
-                pass
+        if sockets:
+            logger.debug(f"[_stop_port:{port}] Принудительное закрытие {len(sockets)} сокетов...")
+            for sock in list(sockets):
+                try:
+                    sock.close()
+                except Exception:
+                    pass
         
         # Отменить активные клиентские задачи
         tasks = self._clients.pop(port, set())
@@ -164,17 +191,22 @@ class StratumProxyServer:
             except Exception:
                 pass
         if tasks:
+            logger.debug(f"[_stop_port:{port}] Ожидание завершения {len(tasks)} задач...")
             try:
                 # Ждем завершения задач с таймаутом, чтобы не зависнуть навсегда
                 await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+                logger.debug(f"[_stop_port:{port}] Задачи завершены.")
             except asyncio.TimeoutError:
                 logger.warning(f"Таймаут ожидания завершения клиентов на порту {port}")
             except Exception as e:
                 logger.warning(f"Ошибка ожидания завершения клиентов на порту {port}: {e}")
+        
         # Очистить учёт воркеров
         self._active_workers.pop(port, None)
         self._worker_counts.pop(port, None)
         self._port_mode.pop(port, None)
+        # Очищаем лок, если порт удаляется совсем (но reload_port держит лок, так что осторожно)
+        # В данном случае мы не удаляем лок из self._port_locks, так как он может использоваться
         logger.info(f"Порт {port} остановлен")
 
     async def _watch_active_modes(self):
@@ -215,27 +247,29 @@ class StratumProxyServer:
 
                 # Сравниваем и перезагружаем только изменившиеся порты
                 for port, new_conf in now_map.items():
+                    # Если порт уже в процессе перезагрузки, пропускаем
+                    if port in self._reloading_ports:
+                        continue
+
                     old_conf = self._port_mode.get(port)
                     # Если режим сменился на sleep, нам нужно не перезагружать порт, а остановить его
                     if new_conf.get("mode_name") == "sleep":
                         if port in self._servers:
                              logger.info(f"Обнаружен переход порта {port} в режим 'sleep'. Останавливаю сервер.")
-                             try:
-                                 await self._stop_port(port)
-                                 self._port_mode[port] = new_conf
-                             except Exception as e:
-                                 logger.warning(f"Ошибка остановки порта {port}: {e}")
+                             # Запускаем асинхронно, чтобы не блокировать цикл
+                             asyncio.create_task(self._stop_port_async(port, new_conf))
                         continue
                         
                     if old_conf != new_conf:
                         logger.info(f"Обнаружено изменение режима на порту {port}: {old_conf} -> {new_conf}. Перезагружаю порт.")
-                        try:
-                            await self.reload_port(port)
-                        except Exception as e:
-                            logger.warning(f"Ошибка перезагрузки порта {port}: {e}")
+                        # Запускаем перезагрузку в фоне, чтобы не блокировать мониторинг других портов
+                        asyncio.create_task(self.reload_port(port))
 
                 # Если появился новый пользователь (новый порт), запускаем его
                 for port in now_map.keys():
+                    if port in self._reloading_ports:
+                        continue
+                        
                     if port not in self._servers:
                         # Если порт в режиме sleep и мы уже знаем об этом, не пытаемся запускать снова
                         cached = self._port_mode.get(port)
@@ -243,6 +277,8 @@ class StratumProxyServer:
                             continue
 
                         try:
+                            # Запуск нового порта тоже лучше делать через таск, если их много, 
+                            # но обычно старт быстрый. Оставим await для простоты, или обернем.
                             await self._start_port(port)
                         except Exception as e:
                             logger.warning(f"Не удалось запустить новый порт {port}: {e}")
@@ -250,12 +286,8 @@ class StratumProxyServer:
                     # Если порт запущен, но режим сменился на sleep, принудительно останавливаем
                     elif port in self._servers and now_map[port].get("mode_name") == "sleep":
                          logger.info(f"Обнаружен активный порт {port} в режиме 'sleep'. Останавливаю сервер.")
-                         try:
-                             await self._stop_port(port)
-                             # Обновляем кэш, чтобы знать, что порт теперь в sleep
-                             self._port_mode[port] = now_map[port]
-                         except Exception as e:
-                             logger.warning(f"Ошибка остановки порта {port}: {e}")
+                         # Также асинхронно
+                         asyncio.create_task(self._stop_port_async(port, now_map[port]))
 
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
@@ -276,6 +308,26 @@ class StratumProxyServer:
                 await bot.session.close()
         except Exception as e:
             logger.warning(f"Ошибка отправки уведомления об оффлайне (bg): {e}")
+
+    async def _stop_port_async(self, port: int, new_conf: dict):
+        """Вспомогательный метод для асинхронной остановки порта (переход в sleep)."""
+        # Блокируем порт, чтобы не конфликтовать с другими операциями
+        if port not in self._port_locks:
+            self._port_locks[port] = asyncio.Lock()
+        lock = self._port_locks[port]
+        
+        if lock.locked():
+             return
+
+        async with lock:
+            try:
+                self._reloading_ports.add(port)
+                await self._stop_port(port)
+                self._port_mode[port] = new_conf
+            except Exception as e:
+                logger.warning(f"Ошибка асинхронной остановки порта {port}: {e}")
+            finally:
+                self._reloading_ports.discard(port)
 
     async def _handle_client(self, miner_reader: asyncio.StreamReader, miner_writer: asyncio.StreamWriter, port: int):
         addr = miner_writer.get_extra_info('peername')
