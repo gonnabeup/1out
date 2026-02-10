@@ -97,6 +97,63 @@ def get_timezone_keyboard():
     builder.row(InlineKeyboardButton(text="Другое", callback_data="set_timezone_OTHER"))
     return builder.as_markup()
 
+def get_admin_users_keyboard(users, page: int = 1, page_size: int = 10):
+    """Клавиатура списка пользователей для админа"""
+    builder = InlineKeyboardBuilder()
+    
+    total = len(users)
+    start = (page - 1) * page_size
+    end = start + page_size
+    slice_users = users[start:end]
+    
+    for user in slice_users:
+        text = f"{user.login} (ID: {user.id})"
+        builder.row(InlineKeyboardButton(text=text, callback_data=f"admin_user_{user.id}"))
+        
+    # Навигация
+    pages = (total + page_size - 1) // page_size
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_users_page_{page - 1}"))
+    if page < pages:
+        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_users_page_{page + 1}"))
+    if nav_row:
+        builder.row(*nav_row)
+        
+    return builder.as_markup()
+
+def get_admin_user_details_keyboard(user_id):
+    """Клавиатура действий с пользователем"""
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="Режимы / Пулы", callback_data=f"admin_modes_{user_id}"))
+    builder.row(InlineKeyboardButton(text="Продлить подписку", callback_data=f"admin_extend_{user_id}"))
+    builder.row(InlineKeyboardButton(text="🔙 К списку", callback_data="admin_users_page_1"))
+    return builder.as_markup()
+
+def get_admin_modes_keyboard(modes, user_id):
+    """Список режимов пользователя для админа"""
+    builder = InlineKeyboardBuilder()
+    for mode in modes:
+        status = "✅ " if mode.is_active else ""
+        text = f"{status}{mode.name} ({mode.host})"
+        builder.row(InlineKeyboardButton(text=text, callback_data=f"admin_mode_view_{mode.id}"))
+    
+    builder.row(InlineKeyboardButton(text="🔙 К пользователю", callback_data=f"admin_user_{user_id}"))
+    return builder.as_markup()
+
+def get_admin_mode_actions_keyboard(mode_id, user_id, is_active):
+    """Действия с режимом"""
+    builder = InlineKeyboardBuilder()
+    if not is_active:
+        builder.row(InlineKeyboardButton(text="▶️ Включить", callback_data=f"admin_mode_activate_{mode_id}"))
+    
+    builder.row(InlineKeyboardButton(text="✏️ Хост", callback_data=f"admin_edit_mode_{mode_id}_host"),
+                InlineKeyboardButton(text="✏️ Порт", callback_data=f"admin_edit_mode_{mode_id}_port"))
+    builder.row(InlineKeyboardButton(text="✏️ Алиас", callback_data=f"admin_edit_mode_{mode_id}_alias"),
+                InlineKeyboardButton(text="✏️ Имя", callback_data=f"admin_edit_mode_{mode_id}_name"))
+    
+    builder.row(InlineKeyboardButton(text="🔙 К списку режимов", callback_data=f"admin_modes_{user_id}"))
+    return builder.as_markup()
 
 def get_schedule_keyboard():
     """Клавиатура для команды расписания (устарела, не используется)"""

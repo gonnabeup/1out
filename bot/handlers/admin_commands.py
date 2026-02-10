@@ -2,8 +2,15 @@ import logging
 from aiogram import Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 from db.models import User, Mode, Schedule
+from bot.keyboards import (
+    get_admin_users_keyboard, 
+    get_admin_user_details_keyboard,
+    get_admin_modes_keyboard,
+    get_admin_mode_actions_keyboard
+)
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +20,9 @@ _proxy_server = None
 def _set_proxy_server(server):
     global _proxy_server
     _proxy_server = server
+
+class AdminModeEdit(StatesGroup):
+    waiting_for_value = State()
 
 async def cmd_admin_help(message: types.Message):
     """Обработчик команды /admin_help"""
@@ -28,30 +38,23 @@ async def cmd_admin_help(message: types.Message):
 
 async def cmd_users(message: types.Message):
     """Обработчик команды /users"""
-    # Получаем сессию БД
     from db.models import init_db, get_session, UserRole
     engine = init_db()
     db_session = get_session(engine)
     
     try:
-        # Проверка прав администратора
         user = db_session.query(User).filter(User.tg_id == message.from_user.id).first()
         if not user or (user.role != UserRole.ADMIN and user.role != UserRole.SUPERADMIN):
             await message.answer("У вас нет прав для выполнения этой команды.")
             return
         
-        users = db_session.query(User).all()
-        
+        users = db_session.query(User).order_by(User.id).all()
         if not users:
             await message.answer("Пользователи не найдены.")
             return
-        
-        response = "Список пользователей:\n\n"
-        for i, user in enumerate(users, 1):
-            response += f"{i}. ID: {user.id}, TG: {user.tg_id}, Логин: {user.login}, Роль: {user.role.value}\n"
-            response += f"   Порт: {user.port}, Подписка до: {user.subscription_until.strftime('%d.%m.%Y')}\n\n"
-        
-        await message.answer(response)
+
+        kb = get_admin_users_keyboard(users)
+        await message.answer("Список пользователей:", reply_markup=kb)
     finally:
         db_session.close()
 
@@ -453,20 +456,182 @@ async def cmd_extendsub(message: types.Message):
     finally:
         db_session.close()
 
-def register_admin_handlers(dp: Dispatcher):
-    """Регистрация обработчиков административных команд"""
-    # существующие команды
-    dp.message.register(cmd_admin_help, Command("admin_help"))
-    dp.message.register(cmd_users, Command("users"))
-    dp.message.register(cmd_stats, Command("stats"))
-    # новые команды и алиасы, соответствующие клавиатуре/README
-    dp.message.register(cmd_adduser, Command("adduser"))
-    dp.message.register(cmd_setsub, Command("setsub"))
-    dp.message.register(cmd_setport, Command("setport"))
-    dp.message.register(cmd_freerange, Command("freerange"))
-    dp.message.register(cmd_listusers, Command("listusers"))
-    dp.message.register(cmd_payments, Command("payments"))
-    dp.message.register(cmd_extendsub, Command("extendsub"))
+# --- Новые обработчики для админ-панели ---
+
+async def process_admin_users_page(callback: types.CallbackQuery):
+    from db.models import init_db, get_session, User
+    engine = init_db()
+    db_session = get_session(engine)
+    try:
+        page = int(callback.data.split("_")[-1])
+        users = db_session.query(User).order_by(User.id).all()
+        kb = get_admin_users_keyboard(users, page=page)
+        await callback.message.edit_text("Список пользователей:", reply_markup=kb)
+    finally:
+        await callback.answer()
+        db_session.close()
+
+async def process_admin_user_select(callback: types.CallbackQuery):
+    from db.models import init_db, get_session, User
+    engine = init_db()
+    db_session = get_session(engine)
+    try:
+        user_id = int(callback.data.split("_")[-1])
+        user = db_session.query(User).filter(User.id == user_id).first()
+        if not user:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        
+        info = (
+            f"👤 Пользователь: {user.login}\n"
+            f"ID: {user.id}\n"
+            f"TG ID: {user.tg_id}\n"
+            f"Порт: {user.port}\n"
+            f"Подписка до: {user.subscription_until.strftime('%d.%m.%Y')}\n"
+            f"Роль: {user.role.value}"
+        )
+        kb = get_admin_user_details_keyboard(user.id)
+        await callback.message.edit_text(info, reply_markup=kb)
+    finally:
+        await callback.answer()
+        db_session.close()
+
+async def process_admin_user_modes(callback: types.CallbackQuery):
+    from db.models import init_db, get_session, Mode
+    engine = init_db()
+    db_session = get_session(engine)
+    try:
+        user_id = int(callback.data.split("_")[-1])
+        modes = db_session.query(Mode).filter(Mode.user_id == user_id).all()
+        kb = get_admin_modes_keyboard(modes, user_id)
+        await callback.message.edit_text(f"Режимы пользователя {user_id}:", reply_markup=kb)
+    finally:
+        await callback.answer()
+        db_session.close()
+
+async def process_admin_mode_view(callback: types.CallbackQuery):
+    from db.models import init_db, get_session, Mode
+    engine = init_db()
+    db_session = get_session(engine)
+    try:
+        mode_id = int(callback.data.split("_")[-1])
+        mode = db_session.query(Mode).filter(Mode.id == mode_id).first()
+        if not mode:
+            await callback.answer("Режим не найден", show_alert=True)
+            return
+            
+        status = "✅ Активен" if mode.is_active else "❌ Не активен"
+        info = (
+            f"🔧 Режим: {mode.name}\n"
+            f"Статус: {status}\n"
+            f"Хост: {mode.host}\n"
+            f"Порт: {mode.port}\n"
+            f"Алиас: {mode.alias}\n"
+        )
+        kb = get_admin_mode_actions_keyboard(mode.id, mode.user_id, mode.is_active)
+        await callback.message.edit_text(info, reply_markup=kb)
+    finally:
+        await callback.answer()
+        db_session.close()
+
+async def process_admin_mode_activate(callback: types.CallbackQuery):
+    from db.models import init_db, get_session, Mode, User
+    engine = init_db()
+    db_session = get_session(engine)
+    try:
+        mode_id = int(callback.data.split("_")[-1])
+        mode = db_session.query(Mode).filter(Mode.id == mode_id).first()
+        if not mode:
+            await callback.answer("Режим не найден", show_alert=True)
+            return
+            
+        # Деактивируем другие режимы
+        db_session.query(Mode).filter(Mode.user_id == mode.user_id).update({"is_active": False})
+        mode.is_active = True
+        db_session.commit()
+        
+        # Перезагрузка порта
+        user = db_session.query(User).filter(User.id == mode.user_id).first()
+        if user and _proxy_server:
+            try:
+                await _proxy_server.reload_port(user.port)
+                await callback.answer("Режим активирован, порт перезагружается")
+            except Exception as e:
+                logger.error(f"Error reloading port {user.port}: {e}")
+                await callback.answer("Режим активирован, но ошибка перезагрузки порта", show_alert=True)
+        else:
+            await callback.answer("Режим активирован (сервер недоступен)", show_alert=True)
+            
+        # Обновляем вид
+        await process_admin_mode_view(callback)
+    finally:
+        db_session.close()
+
+async def process_admin_edit_mode(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    # format: admin_edit_mode_{mode_id}_{field}
+    # parts: ['admin', 'edit', 'mode', '123', 'host']
+    try:
+        mode_id = int(parts[3])
+        field = parts[4]
+    except (IndexError, ValueError):
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+    
+    await state.update_data(mode_id=mode_id, field=field)
+    await state.set_state(AdminModeEdit.waiting_for_value)
+    
+    await callback.message.answer(f"Введите новое значение для поля {field}:")
+    await callback.answer()
+
+async def process_admin_edit_mode_value(message: types.Message, state: FSMContext):
+    if message.text and message.text.lower() in ["отмена", "/cancel"]:
+        await message.answer("Редактирование отменено.")
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    mode_id = data.get('mode_id')
+    field = data.get('field')
+    
+    from db.models import init_db, get_session, Mode, User
+    engine = init_db()
+    db_session = get_session(engine)
+    
+    try:
+        mode = db_session.query(Mode).filter(Mode.id == mode_id).first()
+        if not mode:
+            await message.answer("Режим не найден.")
+            await state.clear()
+            return
+            
+        value = message.text.strip()
+        
+        # Валидация
+        if field == 'port':
+            try:
+                value = int(value)
+            except ValueError:
+                await message.answer("Порт должен быть числом.")
+                return
+        
+        setattr(mode, field, value)
+        db_session.commit()
+        
+        await message.answer(f"Поле {field} обновлено.")
+        
+        # Если режим активен, перезагружаем порт
+        if mode.is_active:
+            user = db_session.query(User).filter(User.id == mode.user_id).first()
+            if user and _proxy_server:
+                await _proxy_server.reload_port(user.port)
+                await message.answer("Порт перезагружен.")
+                
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+    finally:
+        db_session.close()
+        await state.clear()
 
 async def cmd_reloadport(message: types.Message):
     """Точечная перезагрузка порта: /reloadport <port>"""
@@ -527,3 +692,12 @@ def register_admin_handlers(dp: Dispatcher, proxy_server=None):
     dp.callback_query.register(process_pay_approve, F.data.startswith("pay_approve_"))
     dp.callback_query.register(process_pay_reject, F.data.startswith("pay_reject_"))
     dp.callback_query.register(process_pay_seen, F.data.startswith("pay_seen_"))
+    
+    # Админка: Управление пользователями и режимами
+    dp.callback_query.register(process_admin_users_page, F.data.startswith("admin_users_page_"))
+    dp.callback_query.register(process_admin_user_select, F.data.startswith("admin_user_"))
+    dp.callback_query.register(process_admin_user_modes, F.data.startswith("admin_modes_"))
+    dp.callback_query.register(process_admin_mode_view, F.data.startswith("admin_mode_view_"))
+    dp.callback_query.register(process_admin_mode_activate, F.data.startswith("admin_mode_activate_"))
+    dp.callback_query.register(process_admin_edit_mode, F.data.startswith("admin_edit_mode_"))
+    dp.message.register(process_admin_edit_mode_value, AdminModeEdit.waiting_for_value)
