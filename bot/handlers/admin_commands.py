@@ -546,8 +546,8 @@ async def process_admin_mode_activate(callback: types.CallbackQuery):
             return
             
         # Деактивируем другие режимы
-        db_session.query(Mode).filter(Mode.user_id == mode.user_id).update({"is_active": False})
-        mode.is_active = True
+        db_session.query(Mode).filter(Mode.user_id == mode.user_id).update({"is_active": 0})
+        mode.is_active = 1
         db_session.commit()
         
         # Перезагрузка порта
